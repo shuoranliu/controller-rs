@@ -25,27 +25,40 @@ use tokio::{
 };
 use tracing::*;
 
+use std::collections::HashMap;
+
 static DOCUMENT_FINALIZER: &str = "documents.kube.rs";
 
-/// Generate the Kubernetes wrapper struct `Document` from our Spec and Status struct
+#[derive(Deserialize, Serialize, Clone, Debug, Copy, JsonSchema)]
+pub enum DocState {
+    Init,
+    Ready,
+    Export,
+    Deleted,
+}
+
+/// Generate the Kubernetes wrapper struct `Namespace` from our Spec and Status struct
 ///
 /// This provides a hook for generating the CRD yaml (in crdgen.rs)
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[kube(kind = "Document", group = "kube.rs", version = "v1", namespaced)]
-#[kube(status = "DocumentStatus", shortname = "doc")]
+#[kube(kind = "Namespace", group = "kube.rs", version = "v1", namespaced)]
+#[kube(status = "DocumentStatus", shortname = "myns")]
 pub struct DocumentSpec {
     title: String,
     hide: bool,
     content: String,
+    state: DocState,
+    props: HashMap<String, String>,
 }
 
-/// The status object of `Document`
+/// The status object of `Namespace`
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 pub struct DocumentStatus {
     hidden: bool,
+    state: DocState,
 }
 
-impl Document {
+impl Namespace {
     fn was_hidden(&self) -> bool {
         self.status.as_ref().map(|s| s.hidden).unwrap_or(false)
     }
@@ -63,7 +76,7 @@ struct Context {
 }
 
 #[instrument(skip(ctx, doc), fields(trace_id))]
-async fn reconcile(doc: Arc<Document>, ctx: Arc<Context>) -> Result<Action> {
+async fn reconcile(doc: Arc<Namespace>, ctx: Arc<Context>) -> Result<Action> {
     let trace_id = telemetry::get_trace_id();
     Span::current().record("trace_id", &field::display(&trace_id));
     let start = Instant::now();
@@ -71,7 +84,9 @@ async fn reconcile(doc: Arc<Document>, ctx: Arc<Context>) -> Result<Action> {
     let client = ctx.client.clone();
     let name = doc.name_any();
     let ns = doc.namespace().unwrap();
-    let docs: Api<Document> = Api::namespaced(client, &ns);
+    let docs: Api<Namespace> = Api::namespaced(client, &ns);
+
+    info!("First level: name({})", name);
 
     let action = finalizer(&docs, DOCUMENT_FINALIZER, doc, |event| async {
         match event {
@@ -87,17 +102,20 @@ async fn reconcile(doc: Arc<Document>, ctx: Arc<Context>) -> Result<Action> {
         .reconcile_duration
         .with_label_values(&[])
         .observe(duration);
-    info!("Reconciled Document \"{}\" in {}", name, ns);
+    info!(
+        "Reconciled Namespace \"{}\" in {}, action: {:?}",
+        name, ns, action
+    );
     action
 }
 
-fn error_policy(_doc: Arc<Document>, error: &Error, ctx: Arc<Context>) -> Action {
+fn error_policy(_doc: Arc<Namespace>, error: &Error, ctx: Arc<Context>) -> Action {
     warn!("reconcile failed: {:?}", error);
     ctx.metrics.failures.inc();
     Action::requeue(Duration::from_secs(5 * 60))
 }
 
-impl Document {
+impl Namespace {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, kube::Error> {
         let client = ctx.client.clone();
@@ -106,10 +124,19 @@ impl Document {
         let recorder = Recorder::new(client.clone(), reporter, self.object_ref(&()));
         let name = self.name_any();
         let ns = self.namespace().unwrap();
-        let docs: Api<Document> = Api::namespaced(client, &ns);
+        let docs: Api<Namespace> = Api::namespaced(client, &ns);
 
         let should_hide = self.spec.hide;
-        if self.was_hidden() && should_hide {
+        let was_hidden = self.was_hidden();
+        let target_state = self.spec.state;
+        let current_state = self.status.as_ref().map(|s| s.state).unwrap_or(DocState::Init);
+        let props = &self.spec.props;
+
+        info!(
+            "Second level: name: {}, was_hidden: {}, should_hide: {}, target_state: {:?}, current_state: {:?}, props: {:?}",
+            name, was_hidden, should_hide, target_state, current_state, props
+        );
+        if was_hidden && should_hide {
             // only send event the first time
             recorder
                 .publish(Event {
@@ -124,9 +151,10 @@ impl Document {
         // always overwrite status object with what we saw
         let new_status = Patch::Apply(json!({
             "apiVersion": "kube.rs/v1",
-            "kind": "Document",
+            "kind": "Namespace",
             "status": DocumentStatus {
                 hidden: should_hide,
+                state: target_state,
             }
         }));
         let ps = PatchParams::apply("cntrlr").force();
@@ -211,7 +239,7 @@ pub struct Manager {
     diagnostics: Arc<RwLock<Diagnostics>>,
 }
 
-/// Example Manager that owns a Controller for Document
+/// Example Manager that owns a Controller for Namespace
 impl Manager {
     /// Lifecycle initialization interface for app
     ///
@@ -227,7 +255,7 @@ impl Manager {
             diagnostics: diagnostics.clone(),
         });
 
-        let docs = Api::<Document>::all(client);
+        let docs = Api::<Namespace>::all(client);
         // Ensure CRD is installed before loop-watching
         let _r = docs
             .list(&ListParams::default().limit(1))
